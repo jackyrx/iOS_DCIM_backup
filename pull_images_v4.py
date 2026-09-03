@@ -1,181 +1,364 @@
 #!/usr/bin/env python3
+"""
+Pull iPhone DCIM folders over USB (AFC).
 
-import os
-import sys
-import subprocess
-import time
-import multiprocessing
-from datetime import datetime
-import platform
-import re
+New default path uses pymobiledevice3 whole-folder pull for missing
+(or mostly-missing) albums. The old per-file t3 path is kept behind --legacy.
+
+Examples (run from the local DCIM dest, e.g. DCIM_iPhone14ProMax):
+
+  # only albums that do not exist locally
+  python pull_images_v5.py --new
+
+  # every remote album; skip ones that already look complete
+  python pull_images_v5.py --all
+
+  # one album (interrupted 702APPLE, or any name)
+  python pull_images_v5.py --folder 702APPLE
+
+  # old script behaviour: t3 per-file, first N folders / first M new files
+  python pull_images_v5.py --legacy --folders all --files all
+  python pull_images_v5.py --legacy --folders 2 --files 5
+"""
+
+from __future__ import annotations
 
 import argparse
+import logging
+import multiprocessing
+import os
+import platform
+import re
+import subprocess
+import sys
+import time
+import warnings
+from datetime import datetime
+
 from colorama import Fore, Style
 
-import logging
-import warnings
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+warnings.filterwarnings("ignore")
 
-# Configure logging and warnings
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-warnings.filterwarnings('ignore')
+T3_DIR_RE = re.compile(r"IFDIR\s+\S+\s+([\w.]+)/?")
+T3_FILE_RE = re.compile(r"IFREG\s+\S+\s+([\w.]+)")
 
-def run_command(cmd):
-    """Run shell command and return output"""
+
+def run_command(cmd: str) -> str:
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0 and result.stderr:
+        logging.warning(result.stderr.strip())
     return result.stdout.strip()
 
-def main():
 
-    # Set up argument parsing
-    parser = argparse.ArgumentParser(description="Pull images from device")
-    parser.add_argument("--files", type=str, default="5", help="Number of files to download (or 'all')")
-    parser.add_argument("--folders", type=str, default="2", help="Number of folders to process")
-
-    parser.add_argument("-debug", type=int, default=0, help="Debug flag")
-
-    # Parse arguments
-    args = parser.parse_args()
-    file_count = args.files
-    folder_count = args.folders
-    flag_debug = args.debug
-    
-    # Determine available CPU cores
-    if platform.system() == "Darwin":  # macOS
-        available_cores = int(run_command("sysctl -n hw.ncpu"))
-    else:  # Linux
-        available_cores = int(run_command("nproc"))
-    
-    # Set number of threads
-    # num_threads = 10
-    num_threads = int(available_cores * 3 / 4 - 1)
-    print(f"available_cores: {available_cores}")
-    print(f"num_threads: {num_threads}")
-    
-    # Record start time
-    start_time = time.time()
-    start_time_formatted = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logging.info(f"Started at: {start_time_formatted}\n")
-
-    # Get list of folders in DCIM
-    dcim_ls = run_command("t3 fsync ls DCIM")
-    # print(dcim_ls)
-
-    # Extract folder names using regex - matches IFDIR followed by size then captures folder name
-    folder_pattern = r'IFDIR\s+[\w\.]+\s+([\w]+)/'
-    folders = re.findall(folder_pattern, dcim_ls)
+def run_command_checked(cmd: list[str] | str) -> subprocess.CompletedProcess:
+    if isinstance(cmd, str):
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True)
 
 
-    # Determine how many files to download based on parameter
-    if folder_count == "all":
-        folders_to_download = len(folders)
-        print(f"Will download ALL {folders_to_download} new folders")
+def cpu_workers() -> int:
+    if platform.system() == "Darwin":
+        cores = int(run_command("sysctl -n hw.ncpu") or "4")
     else:
-        folders_to_download = min(int(folder_count), len(folders))
-        print(f"Will download {folders_to_download} of {len(folders)} new folders")
+        cores = int(run_command("nproc") or "4")
+    return max(1, int(cores * 3 / 4 - 1))
 
 
-    # Limit to requested number of folders
-    folders = folders[:folders_to_download]
-    print(folders)
-
-    if False:
-        # Filter out folders that already exist locally to avoid redundant processing
-        folders = [folder for folder in folders if not os.path.exists(folder)]
-
-    print(f"Folders [{folders_to_download}] to process (excluding existing ones)")
-    if flag_debug:
-        print(f"{folders}")
-
-    # return
-    
-    # Loop through each folder
-    for idx, folder in enumerate(folders):
-
-        print("\n", "="*30)
-        print(f"Processing folder [{idx+1}/{folders_to_download}] : {folder}")
-
-        # print(os.getcwd())
-        
-        # Create directory if it doesn't exist
-        if not os.path.exists(folder):
-            os.makedirs(folder, exist_ok=True)
-            print(f"Created directory: {folder}")
-        else:
-            print(f"Directory already exists: {folder}")
-
-        os.chdir(folder)
-        print(os.getcwd())
-
-        # Get list of files from remote folder
-        files_ls = run_command(f't3 fsync ls "DCIM/{folder}"')
-        # print(files_ls)
-
-        # Extract filenames using regex - matches IFREG followed by size then captures filename
-        file_pattern = r'IFREG\s+[\w\.]+\s+([\w\.]+)'
-        all_remote_files = re.findall(file_pattern, files_ls)
-        # print(all_remote_files)
-        
-        print("--" * 5)
-        print(f"Found {len(all_remote_files)} files in DCIM/{folder}")
-
-        # Get list of files that already exist in the local folder
-        local_existing_files = os.listdir(os.getcwd())
-
-        # Filter out files that already exist locally to avoid redundant downloads
-        new_files = [file for file in all_remote_files if not file in local_existing_files]
-        print(f"New files to download: {len(new_files)}")
-        
-        # Determine how many files to download based on parameter
-        if file_count == "all":
-            files_to_download = len(new_files)
-            print(f"Will download ALL {files_to_download} new files")
-        else:
-            files_to_download = min(int(file_count), len(new_files))
-            print(f"Will download {files_to_download} of {len(new_files)} new files")
-        
-        # Limit to requested number of files
-        files_to_process = new_files[:files_to_download]
-        print(f"{'-'*5}Files to process [{len(files_to_process)}]: \n")
-
-        if flag_debug:
-            print(f"{files_to_process}")
+def parse_names(ls_text: str, t3_pattern: re.Pattern[str]) -> list[str]:
+    names = t3_pattern.findall(ls_text)
+    if names:
+        return names
+    out = []
+    for line in ls_text.splitlines():
+        line = line.strip().rstrip("/")
+        if not line or line in {".", ".."}:
+            continue
+        if line.startswith("IFDIR") or line.startswith("IFREG"):
+            continue
+        base = os.path.basename(line)
+        if base and base not in out:
+            out.append(base)
+    return out
 
 
-        if len(files_to_process) == 0:
-            print(f"{Fore.YELLOW}No new files need to be downloaded{Style.RESET_ALL}")
-            logging.info("No new files need to be downloaded\n\n")
-        else:
-            logging.info(f"New files need to be downloaded {'-'*10} \n\n")
-        
-        # continue
-        # os.chdir("..")
+def list_remote_folders() -> list[str]:
+    pmd = run_command("pymobiledevice3 afc ls /DCIM")
+    folders = parse_names(pmd, T3_DIR_RE)
+    if folders:
+        return folders
+    t3 = run_command("t3 fsync ls DCIM")
+    return parse_names(t3, T3_DIR_RE)
 
-        with multiprocessing.Pool(processes=num_threads) as pool:
-            commands = [f't3 fsync pull "DCIM/{folder}/{file}"' for file in files_to_process]
-            pool.map(run_command, commands)
-        
-        # Return to parent directory
-        os.chdir("..")
-    
-    # Record end time and calculate duration
+
+def list_remote_files(folder: str) -> list[str]:
+    pmd = run_command(f'pymobiledevice3 afc ls "/DCIM/{folder}"')
+    files = parse_names(pmd, T3_FILE_RE)
+    if files:
+        return files
+    t3 = run_command(f't3 fsync ls "DCIM/{folder}"')
+    return parse_names(t3, T3_FILE_RE)
+
+
+def local_files(folder: str) -> set[str]:
+    if not os.path.isdir(folder):
+        return set()
+    names = set()
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        if os.path.getsize(path) <= 0:
+            continue
+        names.add(name)
+    return names
+
+
+def folder_sort_key(name: str) -> tuple:
+    m = re.match(r"(\d+)([A-Z]+)$", name, re.I)
+    if m:
+        return (m.group(2).upper(), -int(m.group(1)))
+    return (name, 0)
+
+
+def print_duration(start_time: float, start_fmt: str) -> None:
     end_time = time.time()
-    end_time_formatted = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    end_fmt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     duration = int(end_time - start_time)
     hours, remainder = divmod(duration, 3600)
     minutes, seconds = divmod(remainder, 60)
-    duration_formatted = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    
     print("Download complete!")
-    print(f"Started at: {start_time_formatted}")
-    print(f"Finished at: {end_time_formatted}")
-    print(f"Total time: {duration_formatted} (HH:MM:SS)")
+    print(f"Started at: {start_fmt}")
+    print(f"Finished at: {end_fmt}")
+    print(f"Total time: {hours:02d}:{minutes:02d}:{seconds:02d} (HH:MM:SS)")
+
+
+def pull_folder_pmd3(folder: str) -> int:
+    """Whole-folder pull into cwd. Do not mkdir first."""
+    cmd = [
+        "pymobiledevice3",
+        "afc",
+        "pull",
+        f"/DCIM/{folder}",
+        ".",
+        "--ignore-errors",
+    ]
+    print(f"{Fore.CYAN}Whole-folder pull:{Style.RESET_ALL} {' '.join(cmd)}")
+    started = time.time()
+    proc = subprocess.run(cmd)
+    elapsed = int(time.time() - started)
+    print(f"Finished {folder} in {elapsed}s, exit={proc.returncode}")
+    return proc.returncode
+
+
+def pull_files_t3(folder: str, files: list[str], workers: int, debug: bool) -> None:
+    if not files:
+        print(f"{Fore.YELLOW}No new files need to be downloaded{Style.RESET_ALL}")
+        logging.info("No new files need to be downloaded")
+        return
+    os.makedirs(folder, exist_ok=True)
+    print(f"Per-file t3 pull: {len(files)} files, workers={workers}")
+    if debug:
+        print(files)
+    here = os.getcwd()
+    os.chdir(folder)
+    try:
+        commands = [f't3 fsync pull --force "DCIM/{folder}/{name}"' for name in files]
+        with multiprocessing.Pool(processes=max(1, workers)) as pool:
+            pool.map(run_command, commands)
+    finally:
+        os.chdir(here)
+
+
+def decide_action(
+    folder: str,
+    remote: list[str],
+    local: set[str],
+    missing_count: int,
+    missing_pct: float,
+) -> str:
+    """
+    skip | folder | files
+    """
+    if not remote:
+        return "skip"
+    if not os.path.isdir(folder) or len(local) == 0:
+        return "folder"
+    missing = [name for name in remote if name not in local]
+    if not missing:
+        return "skip"
+    pct = 100.0 * len(missing) / max(len(remote), 1)
+    if len(missing) >= missing_count or pct >= missing_pct:
+        return "folder"
+    return "files"
+
+
+def run_smart(args: argparse.Namespace) -> None:
+    remote_folders = list_remote_folders()
+    if not remote_folders:
+        print(f"{Fore.RED}No remote DCIM folders found. Is the phone connected?{Style.RESET_ALL}")
+        sys.exit(1)
+
+    if args.folder:
+        wanted = args.folder.strip().rstrip("/")
+        if wanted not in remote_folders:
+            print(f"{Fore.RED}Remote folder not found: {wanted}{Style.RESET_ALL}")
+            print("Available (first 20):", remote_folders[:20])
+            sys.exit(1)
+        selected = [wanted]
+        label = f"specific folder {wanted}"
+    elif args.new:
+        selected = [name for name in remote_folders if not os.path.isdir(name) or len(local_files(name)) == 0]
+        label = "new local folders only"
+    else:
+        selected = list(remote_folders)
+        label = "all remote folders"
+
+    if args.newest_first:
+        selected = sorted(selected, key=folder_sort_key)
+
+    print(f"Remote albums: {len(remote_folders)}")
+    print(f"Selected ({label}): {len(selected)}")
+    if args.debug:
+        print(selected)
+
+    workers = cpu_workers()
+    print(f"file-level workers: {workers}")
+
+    for idx, folder in enumerate(selected, start=1):
+        print("\n", "=" * 30)
+        print(f"Processing folder [{idx}/{len(selected)}] : {folder}")
+
+        remote = list_remote_files(folder)
+        local = local_files(folder)
+        missing = [name for name in remote if name not in local]
+        print(f"Remote files: {len(remote)}")
+        print(f"Local files:  {len(local)}")
+        print(f"Missing:      {len(missing)}")
+
+        action = decide_action(
+            folder,
+            remote,
+            local,
+            missing_count=args.missing_count,
+            missing_pct=args.missing_pct,
+        )
+        if args.force_folder and action != "skip":
+            action = "folder"
+
+        if action == "skip":
+            print(f"{Fore.YELLOW}Skip (complete or empty remote){Style.RESET_ALL}")
+            logging.info("Skip %s", folder)
+            continue
+
+        if action == "folder":
+            logging.info("Whole-folder pull %s (%s missing of %s)", folder, len(missing), len(remote))
+            pull_folder_pmd3(folder)
+            continue
+
+        logging.info("Per-file pull %s (%s files)", folder, len(missing))
+        pull_files_t3(folder, missing, workers=min(workers, 4), debug=args.debug)
+
+
+def run_legacy(args: argparse.Namespace) -> None:
+    workers = cpu_workers()
+    print(f"available_cores workers: {workers}")
+
+    folders = list_remote_folders()
+    if not folders:
+        print(f"{Fore.RED}No remote DCIM folders found.{Style.RESET_ALL}")
+        sys.exit(1)
+
+    if args.folder:
+        wanted = args.folder.strip().rstrip("/")
+        folders = [wanted] if wanted in folders else []
+        if not folders:
+            print(f"{Fore.RED}Remote folder not found: {wanted}{Style.RESET_ALL}")
+            sys.exit(1)
+    elif args.folders == "all":
+        pass
+    else:
+        folders = folders[: min(int(args.folders), len(folders))]
+
+    print(f"Legacy t3 per-file. Folders: {len(folders)}")
+    print(folders)
+
+    for idx, folder in enumerate(folders, start=1):
+        print("\n", "=" * 30)
+        print(f"Processing folder [{idx}/{len(folders)}] : {folder}")
+        os.makedirs(folder, exist_ok=True)
+        remote = list_remote_files(folder)
+        local = local_files(folder)
+        new_files = [name for name in remote if name not in local]
+        print(f"Found {len(remote)} files in DCIM/{folder}")
+        print(f"New files to download: {len(new_files)}")
+
+        if args.files == "all":
+            files_to_process = new_files
+        else:
+            files_to_process = new_files[: min(int(args.files), len(new_files))]
+
+        print(f"Files to process [{len(files_to_process)}]")
+        if args.debug:
+            print(files_to_process)
+        pull_files_t3(folder, files_to_process, workers=workers, debug=args.debug)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Pull iPhone DCIM albums. Default is smart whole-folder pull for new albums."
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--new", action="store_true", help="Only albums missing locally (default)")
+    mode.add_argument("--all", action="store_true", help="All remote albums; skip complete ones")
+    mode.add_argument("--folder", type=str, help='One album name, e.g. "702APPLE"')
+    mode.add_argument("--legacy", action="store_true", help="Old t3 per-file path (--folders / --files)")
+
+    parser.add_argument("--folders", type=str, default="2", help="Legacy: how many folders (or 'all')")
+    parser.add_argument("--files", type=str, default="5", help="Legacy: how many new files per folder (or 'all')")
+    parser.add_argument(
+        "--missing-count",
+        type=int,
+        default=50,
+        help="If missing files >= this, whole-folder pull instead of per-file (default 50)",
+    )
+    parser.add_argument(
+        "--missing-pct",
+        type=float,
+        default=10.0,
+        help="If missing percent >= this, whole-folder pull (default 10)",
+    )
+    parser.add_argument(
+        "--force-folder",
+        action="store_true",
+        help="Force pymobiledevice3 whole-folder pull even when only a few files are missing",
+    )
+    parser.add_argument("--newest-first", action="store_true", help="Sort 801APPLE before 126APPLE")
+    parser.add_argument("-debug", "--debug", type=int, default=0, help="Print file lists")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if not args.legacy and not args.all and not args.folder and not args.new:
+        args.new = True
+
+    start_time = time.time()
+    start_fmt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logging.info("Started at: %s", start_fmt)
+    print(f"cwd: {os.getcwd()}")
+
+    try:
+        if args.legacy:
+            run_legacy(args)
+        else:
+            run_smart(args)
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}Interrupted. Re-run the same command; complete albums will be skipped.{Style.RESET_ALL}")
+        sys.exit(130)
+
+    print_duration(start_time, start_fmt)
+
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
