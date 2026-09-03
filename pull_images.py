@@ -112,7 +112,15 @@ def list_remote_files(folder: str) -> list[str]:
         t3 = run_command(f't3 fsync ls "DCIM/{folder}"', timeout=20)
         files = parse_names(t3, T3_FILE_RE)
 
-    return [f for f in files if f != folder and f not in {".", ".."}]
+    valid_files = []
+    for f in files:
+        if f == folder or f in {".", "..", "Timelapse", "Incoming"}:
+            continue
+          
+        if "." in f and not f.startswith("."):
+            valid_files.append(f)
+            
+    return valid_files
 
 
 def local_files(folder: str) -> set[str]:
