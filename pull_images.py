@@ -44,24 +44,32 @@ T3_DIR_RE = re.compile(r"IFDIR\s+\S+\s+([\w.]+)/?")
 T3_FILE_RE = re.compile(r"IFREG\s+\S+\s+([\w.]+)")
 
 
-def run_command(cmd: str) -> str:
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0 and result.stderr:
-        logging.warning(result.stderr.strip())
-    return result.stdout.strip()
+def run_command(cmd: str, timeout: int | None = 30) -> str:
+    """Run shell command with clear stdout logging and timeout protection."""
+    print(f"{Fore.BLUE}[CMD]{Style.RESET_ALL} {cmd}", flush=True)
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0 and result.stderr:
+            logging.warning(f"Command returned exit code {result.returncode}: {result.stderr.strip()}")
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        print(f"{Fore.RED}[TIMEOUT]{Style.RESET_ALL} Command timed out after {timeout}s: {cmd}", flush=True)
+        return ""
 
 
 def run_command_checked(cmd: list[str] | str) -> subprocess.CompletedProcess:
     if isinstance(cmd, str):
+        print(f"{Fore.BLUE}[CMD]{Style.RESET_ALL} {cmd}", flush=True)
         return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print(f"{Fore.BLUE}[CMD]{Style.RESET_ALL} {' '.join(cmd)}", flush=True)
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
 def cpu_workers() -> int:
     if platform.system() == "Darwin":
-        cores = int(run_command("sysctl -n hw.ncpu") or "4")
+        cores = int(run_command("sysctl -n hw.ncpu", timeout=5) or "4")
     else:
-        cores = int(run_command("nproc") or "4")
+        cores = int(run_command("nproc", timeout=5) or "4")
     return max(1, int(cores * 3 / 4 - 1))
 
 
@@ -83,20 +91,26 @@ def parse_names(ls_text: str, t3_pattern: re.Pattern[str]) -> list[str]:
 
 
 def list_remote_folders() -> list[str]:
-    pmd = run_command("pymobiledevice3 afc ls /DCIM")
+    print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Querying remote DCIM directory listing via pymobiledevice3...", flush=True)
+    pmd = run_command("pymobiledevice3 afc ls /DCIM", timeout=20)
     folders = parse_names(pmd, T3_DIR_RE)
     if folders:
         return folders
-    t3 = run_command("t3 fsync ls DCIM")
+    
+    print(f"{Fore.YELLOW}[WARN]{Style.RESET_ALL} pymobiledevice3 failed or returned empty. Falling back to t3...", flush=True)
+    t3 = run_command("t3 fsync ls DCIM", timeout=20)
     return parse_names(t3, T3_DIR_RE)
 
 
 def list_remote_files(folder: str) -> list[str]:
-    pmd = run_command(f'pymobiledevice3 afc ls "/DCIM/{folder}"')
+    print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Querying file list for /DCIM/{folder} via pymobiledevice3...", flush=True)
+    pmd = run_command(f'pymobiledevice3 afc ls "/DCIM/{folder}"', timeout=20)
     files = parse_names(pmd, T3_FILE_RE)
     if files:
         return files
-    t3 = run_command(f't3 fsync ls "DCIM/{folder}"')
+    
+    print(f"{Fore.YELLOW}[WARN]{Style.RESET_ALL} pymobiledevice3 returned empty for {folder}. Falling back to t3...", flush=True)
+    t3 = run_command(f't3 fsync ls "DCIM/{folder}"', timeout=20)
     return parse_names(t3, T3_FILE_RE)
 
 
@@ -127,10 +141,10 @@ def print_duration(start_time: float, start_fmt: str) -> None:
     duration = int(end_time - start_time)
     hours, remainder = divmod(duration, 3600)
     minutes, seconds = divmod(remainder, 60)
-    print("Download complete!")
-    print(f"Started at: {start_fmt}")
-    print(f"Finished at: {end_fmt}")
-    print(f"Total time: {hours:02d}:{minutes:02d}:{seconds:02d} (HH:MM:SS)")
+    print("Download complete!", flush=True)
+    print(f"Started at: {start_fmt}", flush=True)
+    print(f"Finished at: {end_fmt}", flush=True)
+    print(f"Total time: {hours:02d}:{minutes:02d}:{seconds:02d} (HH:MM:SS)", flush=True)
 
 
 def pull_folder_pmd3(folder: str) -> int:
@@ -143,23 +157,23 @@ def pull_folder_pmd3(folder: str) -> int:
         ".",
         "--ignore-errors",
     ]
-    print(f"{Fore.CYAN}Whole-folder pull:{Style.RESET_ALL} {' '.join(cmd)}")
+    print(f"{Fore.CYAN}Whole-folder pull:{Style.RESET_ALL} {' '.join(cmd)}", flush=True)
     started = time.time()
     proc = subprocess.run(cmd)
     elapsed = int(time.time() - started)
-    print(f"Finished {folder} in {elapsed}s, exit={proc.returncode}")
+    print(f"Finished {folder} in {elapsed}s, exit={proc.returncode}", flush=True)
     return proc.returncode
 
 
 def pull_files_t3(folder: str, files: list[str], workers: int, debug: bool) -> None:
     if not files:
-        print(f"{Fore.YELLOW}No new files need to be downloaded{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}No new files need to be downloaded{Style.RESET_ALL}", flush=True)
         logging.info("No new files need to be downloaded")
         return
     os.makedirs(folder, exist_ok=True)
-    print(f"Per-file t3 pull: {len(files)} files, workers={workers}")
+    print(f"Per-file t3 pull: {len(files)} files, workers={workers}", flush=True)
     if debug:
-        print(files)
+        print(files, flush=True)
     here = os.getcwd()
     os.chdir(folder)
     try:
@@ -196,14 +210,14 @@ def decide_action(
 def run_smart(args: argparse.Namespace) -> None:
     remote_folders = list_remote_folders()
     if not remote_folders:
-        print(f"{Fore.RED}No remote DCIM folders found. Is the phone connected?{Style.RESET_ALL}")
+        print(f"{Fore.RED}No remote DCIM folders found. Is the phone unlocked and computer trusted?{Style.RESET_ALL}", flush=True)
         sys.exit(1)
 
     if args.folder:
         wanted = args.folder.strip().rstrip("/")
         if wanted not in remote_folders:
-            print(f"{Fore.RED}Remote folder not found: {wanted}{Style.RESET_ALL}")
-            print("Available (first 20):", remote_folders[:20])
+            print(f"{Fore.RED}Remote folder not found: {wanted}{Style.RESET_ALL}", flush=True)
+            print("Available (first 20):", remote_folders[:20], flush=True)
             sys.exit(1)
         selected = [wanted]
         label = f"specific folder {wanted}"
@@ -217,24 +231,24 @@ def run_smart(args: argparse.Namespace) -> None:
     if args.newest_first:
         selected = sorted(selected, key=folder_sort_key)
 
-    print(f"Remote albums: {len(remote_folders)}")
-    print(f"Selected ({label}): {len(selected)}")
+    print(f"Remote albums: {len(remote_folders)}", flush=True)
+    print(f"Selected ({label}): {len(selected)}", flush=True)
     if args.debug:
-        print(selected)
+        print(selected, flush=True)
 
     workers = cpu_workers()
-    print(f"file-level workers: {workers}")
+    print(f"file-level workers: {workers}", flush=True)
 
     for idx, folder in enumerate(selected, start=1):
-        print("\n", "=" * 30)
-        print(f"Processing folder [{idx}/{len(selected)}] : {folder}")
+        print("\n", "=" * 30, flush=True)
+        print(f"Processing folder [{idx}/{len(selected)}] : {folder}", flush=True)
 
         remote = list_remote_files(folder)
         local = local_files(folder)
         missing = [name for name in remote if name not in local]
-        print(f"Remote files: {len(remote)}")
-        print(f"Local files:  {len(local)}")
-        print(f"Missing:      {len(missing)}")
+        print(f"Remote files: {len(remote)}", flush=True)
+        print(f"Local files:  {len(local)}", flush=True)
+        print(f"Missing:      {len(missing)}", flush=True)
 
         action = decide_action(
             folder,
@@ -247,7 +261,7 @@ def run_smart(args: argparse.Namespace) -> None:
             action = "folder"
 
         if action == "skip":
-            print(f"{Fore.YELLOW}Skip (complete or empty remote){Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Skip (complete or empty remote){Style.RESET_ALL}", flush=True)
             logging.info("Skip %s", folder)
             continue
 
@@ -262,45 +276,45 @@ def run_smart(args: argparse.Namespace) -> None:
 
 def run_legacy(args: argparse.Namespace) -> None:
     workers = cpu_workers()
-    print(f"available_cores workers: {workers}")
+    print(f"available_cores workers: {workers}", flush=True)
 
     folders = list_remote_folders()
     if not folders:
-        print(f"{Fore.RED}No remote DCIM folders found.{Style.RESET_ALL}")
+        print(f"{Fore.RED}No remote DCIM folders found.{Style.RESET_ALL}", flush=True)
         sys.exit(1)
 
     if args.folder:
         wanted = args.folder.strip().rstrip("/")
         folders = [wanted] if wanted in folders else []
         if not folders:
-            print(f"{Fore.RED}Remote folder not found: {wanted}{Style.RESET_ALL}")
+            print(f"{Fore.RED}Remote folder not found: {wanted}{Style.RESET_ALL}", flush=True)
             sys.exit(1)
     elif args.folders == "all":
         pass
     else:
         folders = folders[: min(int(args.folders), len(folders))]
 
-    print(f"Legacy t3 per-file. Folders: {len(folders)}")
-    print(folders)
+    print(f"Legacy t3 per-file. Folders: {len(folders)}", flush=True)
+    print(folders, flush=True)
 
     for idx, folder in enumerate(folders, start=1):
-        print("\n", "=" * 30)
-        print(f"Processing folder [{idx}/{len(folders)}] : {folder}")
+        print("\n", "=" * 30, flush=True)
+        print(f"Processing folder [{idx}/{len(folders)}] : {folder}", flush=True)
         os.makedirs(folder, exist_ok=True)
         remote = list_remote_files(folder)
         local = local_files(folder)
         new_files = [name for name in remote if name not in local]
-        print(f"Found {len(remote)} files in DCIM/{folder}")
-        print(f"New files to download: {len(new_files)}")
+        print(f"Found {len(remote)} files in DCIM/{folder}", flush=True)
+        print(f"New files to download: {len(new_files)}", flush=True)
 
         if args.files == "all":
             files_to_process = new_files
         else:
             files_to_process = new_files[: min(int(args.files), len(new_files))]
 
-        print(f"Files to process [{len(files_to_process)}]")
+        print(f"Files to process [{len(files_to_process)}]", flush=True)
         if args.debug:
-            print(files_to_process)
+            print(files_to_process, flush=True)
         pull_files_t3(folder, files_to_process, workers=workers, debug=args.debug)
 
 
@@ -346,7 +360,7 @@ def main() -> None:
     start_time = time.time()
     start_fmt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logging.info("Started at: %s", start_fmt)
-    print(f"cwd: {os.getcwd()}")
+    print(f"cwd: {os.getcwd()}", flush=True)
 
     try:
         if args.legacy:
@@ -354,7 +368,7 @@ def main() -> None:
         else:
             run_smart(args)
     except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}Interrupted. Re-run the same command; complete albums will be skipped.{Style.RESET_ALL}")
+        print(f"\n{Fore.YELLOW}Interrupted. Re-run the same command; complete albums will be skipped.{Style.RESET_ALL}", flush=True)
         sys.exit(130)
 
     print_duration(start_time, start_fmt)
