@@ -117,4 +117,3 @@ You can safely interrupt the process anytime using `Ctrl + C`. Rerunning the com
 
 
 Distributed under the MIT License. This tool is provided "AS IS", without warranty of any kind. Always verify your backups before deleting original media from your device.
-```
