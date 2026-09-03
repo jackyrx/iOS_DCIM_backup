@@ -106,12 +106,13 @@ def list_remote_files(folder: str) -> list[str]:
     print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Querying file list for /DCIM/{folder} via pymobiledevice3...", flush=True)
     pmd = run_command(f'pymobiledevice3 afc ls "/DCIM/{folder}"', timeout=20)
     files = parse_names(pmd, T3_FILE_RE)
-    if files:
-        return files
     
-    print(f"{Fore.YELLOW}[WARN]{Style.RESET_ALL} pymobiledevice3 returned empty for {folder}. Falling back to t3...", flush=True)
-    t3 = run_command(f't3 fsync ls "DCIM/{folder}"', timeout=20)
-    return parse_names(t3, T3_FILE_RE)
+    if not files:
+        print(f"{Fore.YELLOW}[WARN]{Style.RESET_ALL} pymobiledevice3 returned empty for {folder}. Falling back to t3...", flush=True)
+        t3 = run_command(f't3 fsync ls "DCIM/{folder}"', timeout=20)
+        files = parse_names(t3, T3_FILE_RE)
+
+    return [f for f in files if f != folder and f not in {".", ".."}]
 
 
 def local_files(folder: str) -> set[str]:
